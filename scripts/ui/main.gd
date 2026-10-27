@@ -2,7 +2,7 @@ extends Control
 
 const Rules = preload("res://scripts/rules/battle_rules.gd")
 const AI = preload("res://scripts/rules/battle_ai.gd")
-
+const DieThrow = preload("res://scripts/ui/die_throw.gd")
 const INK := Color("2c2416")
 const CREAM := Color("fff8ee")
 const PAPER := Color("f3e6d0")
@@ -25,6 +25,28 @@ const RUG_SLOTS: Array[Rect2] = [
 	Rect2(0.586, 0.692, 0.134, 0.125),
 ]
 const BOSS_SLOT := Rect2(0.068, 0.390, 0.125, 0.150)
+const FLOOR_SLOTS: Array[Rect2] = [
+	Rect2(0.020, 0.548, 0.090, 0.100),
+	Rect2(0.118, 0.548, 0.090, 0.100),
+	Rect2(0.020, 0.640, 0.090, 0.100),
+	Rect2(0.118, 0.640, 0.090, 0.100),
+	Rect2(0.020, 0.732, 0.090, 0.100),
+	Rect2(0.118, 0.732, 0.090, 0.100),
+	Rect2(0.758, 0.548, 0.090, 0.100),
+	Rect2(0.758, 0.640, 0.090, 0.100),
+	Rect2(0.758, 0.732, 0.090, 0.100),
+	Rect2(0.855, 0.640, 0.090, 0.100),
+	Rect2(0.855, 0.732, 0.090, 0.100),
+	Rect2(0.250, 0.548, 0.090, 0.100),
+	Rect2(0.28, 0.935, 0.078, 0.055),
+	Rect2(0.37, 0.935, 0.078, 0.055),
+	Rect2(0.46, 0.935, 0.078, 0.055),
+	Rect2(0.55, 0.935, 0.078, 0.055),
+	Rect2(0.64, 0.935, 0.078, 0.055),
+	Rect2(0.73, 0.935, 0.078, 0.055),
+	Rect2(0.82, 0.935, 0.078, 0.055),
+	Rect2(0.905, 0.82, 0.078, 0.075),
+]
 
 var rules = Rules.new()
 var host: MarginContainer
@@ -39,10 +61,19 @@ var _ai_busy := false
 var _ai_token := 0
 var _shot := ""
 var _tex := {}
+var _spot: Dictionary = {}
+var _rolling := false
+var _roll_token := 0
+var _reveal_owner := -1
+var _shown_face := 0
+var _result_hold := false
+var roll_sheet: Control
+const TOKEN := Vector2(0.090, 0.100)
+const PIECE_SIZE := Vector2(0.112, 0.120)
 
 var scroll: ScrollContainer
 var board_box: BoxContainer
-var action_box: VBoxContainer
+var action_box: BoxContainer
 var _army_buttons: Array[Button] = []
 var _ai_army_button: Button
 var log_label: Label
@@ -102,6 +133,12 @@ func _go(screen: String) -> void:
 
 
 func _build(screen: String) -> void:
+	_roll_token += 1
+	_rolling = false
+	_reveal_owner = -1
+	_shown_face = 0
+	_result_hold = false
+	roll_sheet = null
 	_screen = screen
 	_close_modal()
 	_wipe(host)
@@ -109,6 +146,9 @@ func _build(screen: String) -> void:
 	_pending = {}
 	_picked = []
 	_error = ""
+	var inset := 0 if screen == "battle" else 16
+	for side in ["margin_left", "margin_top", "margin_right", "margin_bottom"]:
+		host.add_theme_constant_override(side, inset)
 	match screen:
 		"menu":
 			_build_menu()
@@ -121,7 +161,7 @@ func _build(screen: String) -> void:
 		"initiative":
 			_build_initiative()
 		"battle":
-			if rules.phase != "battle":
+			if rules.phase != "battle" and rules.phase != "initiative":
 				_boot_sample_battle()
 			_build_battle()
 		"result":
@@ -140,6 +180,7 @@ func _capture_shot() -> void:
 func _start_match() -> void:
 	_cancel_ai()
 	rules = Rules.new()
+	_spot = {}
 	rules.setup_match(human_color, ai_color)
 	rules.player_names = ["You", "AI"]
 
@@ -260,7 +301,7 @@ func _build_deploy() -> void:
 	row.add_child(side_panel)
 	var side := _side_box(side_panel)
 	side.add_child(_title("Deploy"))
-	side.add_child(_body("Tap one of your pieces, then tap a sofa or rug slot. The Boss stays on the floor. One Yarn Cannon can use the sofa or the rug, and it needs two slots side by side."))
+	side.add_child(_body("Tap a piece, then tap anywhere on the living room to stand it there. Tap a sofa or rug slot only when you want that defense. The Boss can stand anywhere except the sofa and the rug. One Yarn Cannon can use the sofa or the rug, and it needs two slots side by side."))
 	status_label = _body("")
 	side.add_child(status_label)
 	_refresh_deploy_status()
@@ -279,12 +320,17 @@ func _fill_deploy_board() -> void:
 func _refresh_deploy_status() -> void:
 	if status_label == null:
 		return
-	var name := "nothing selected"
+	var name := "piece"
 	if _selected != "":
 		var p = rules.piece(_selected)
 		if not p.is_empty():
 			name = _kind_label(p)
-	var note := _error if _error != "" else "Selected: %s" % name
+	var note := _error
+	if _error == "":
+		if _selected == "":
+			note = "Selected: nothing selected"
+		else:
+			note = "Selected: %s. Tap the living room to place it." % name
 	status_label.text = note
 
 
@@ -333,7 +379,7 @@ func _lock_deploy() -> void:
 		_error = err
 		_refresh_deploy_status()
 		return
-	_go("initiative")
+	_go("battle")
 
 
 func _build_initiative() -> void:
@@ -381,49 +427,11 @@ func _die_view(face: int, caption: String) -> VBoxContainer:
 
 
 func _build_battle() -> void:
-	var column := VBoxContainer.new()
-	column.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	column.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	column.add_theme_constant_override("separation", 8)
-	host.add_child(column)
-	header_label = _title("")
-	column.add_child(header_label)
-	var row := HBoxContainer.new()
-	row.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	row.add_theme_constant_override("separation", 12)
-	column.add_child(row)
-	scroll = ScrollContainer.new()
-	scroll.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
-	row.add_child(scroll)
-	board_box = HBoxContainer.new()
+	board_box = VBoxContainer.new()
 	board_box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	board_box.add_theme_constant_override("separation", 10)
-	scroll.add_child(board_box)
-	scroll.resized.connect(func() -> void:
-		if board_box != null:
-			board_box.custom_minimum_size.x = scroll.size.x - 4.0
-	)
-	var side_panel := _side_panel()
-	row.add_child(side_panel)
-	var side := _side_box(side_panel)
-	die_rect = TextureRect.new()
-	die_rect.custom_minimum_size = Vector2(72, 72)
-	die_rect.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
-	die_rect.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
-	side.add_child(die_rect)
-	status_label = _body("")
-	side.add_child(status_label)
-	action_box = VBoxContainer.new()
-	action_box.add_theme_constant_override("separation", 8)
-	side.add_child(action_box)
-	log_label = _body("")
-	log_label.custom_minimum_size = Vector2(0, 140)
-	side.add_child(log_label)
-	side.add_child(_button("How to play", _open_help, CREAM, INK))
-	side.add_child(_button("Leave battle", _confirm_leave, CREAM, INK))
+	board_box.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	board_box.add_theme_constant_override("separation", 0)
+	host.add_child(board_box)
 	_fill_battle()
 	_maybe_ai()
 
@@ -431,73 +439,344 @@ func _build_battle() -> void:
 func _fill_battle() -> void:
 	if board_box == null:
 		return
-	var kept := 0
-	if scroll != null:
-		kept = scroll.scroll_vertical
 	_wipe(board_box)
-	board_box.add_child(_army_block(1, false))
-	board_box.add_child(_army_block(0, false))
+	die_rect = null
+	status_label = null
+	log_label = null
+	action_box = null
+	roll_sheet = null
+	board_box.add_child(_army_block(_battle_focus(), false))
 	if header_label != null:
-		var turn := "Your attack" if rules.current_player == 0 else "AI attack"
-		if rules.phase == "game_over":
-			turn = "Battle over"
-		header_label.text = "You %d VP    ·    AI %d VP    ·    %s" % [rules.vp(0), rules.vp(1), turn]
+		header_label.text = _room_title(_battle_focus())
 	_sync_die()
 	_fill_actions()
 	_sync_log()
-	if scroll != null:
-		scroll.scroll_vertical = kept
 
 
 func _sync_die() -> void:
 	if die_rect == null:
 		return
-	if rules.roll >= 1 and rules.roll <= 6 and rules.stage == "act":
-		die_rect.texture = _art("res://assets/ui/d%d.png" % rules.roll)
-	else:
+	if _rolling or rules.stage != "act" or rules.roll < 1 or rules.roll > 6:
 		die_rect.texture = null
+	else:
+		die_rect.texture = _art("res://assets/ui/d%d.png" % rules.roll)
 
 
 func _sync_log() -> void:
 	if log_label == null:
 		return
-	var start := maxi(0, rules.log.size() - 6)
-	var lines: PackedStringArray = []
-	for i in range(start, rules.log.size()):
-		lines.append(str(rules.log[i]))
-	log_label.text = "\n".join(lines)
+	if _rolling or _reveal_owner >= 0:
+		log_label.text = ""
+		return
+	if rules.phase == "initiative":
+		log_label.text = "A tie is rolled again."
+		return
+	if rules.log.is_empty():
+		log_label.text = ""
+		return
+	log_label.text = str(rules.log[rules.log.size() - 1])
+
+
+func _battle_focus() -> int:
+	if _reveal_owner >= 0:
+		return _reveal_owner
+	if rules.phase == "initiative":
+		return 0
+	if rules.current_player == 0 and not _pending.is_empty():
+		return 1
+	return rules.current_player
 
 
 func _fill_actions() -> void:
-	if action_box == null:
+	if roll_sheet == null:
 		return
-	_wipe(action_box)
-	if status_label != null:
-		status_label.text = _error
+	_wipe(roll_sheet)
+	action_box = null
+	die_rect = null
+	if _rolling:
+		return
+	var face := _visible_roll()
+	if _result_hold and face > 0:
+		_build_roll_splash(face)
+		return
+	if rules.phase == "initiative" or (rules.phase == "battle" and rules.stage == "roll" and rules.current_player == 0 and _pending.is_empty()):
+		_build_roll_prompt("Tap the room to roll")
+		return
 	if _ai_busy or (rules.current_player == 1 and rules.phase == "battle"):
-		action_box.add_child(_body("The other army is moving."))
+		_build_roll_prompt("The other army is moving.")
 		return
-	if rules.phase != "battle":
+	if rules.phase != "battle" or rules.stage != "act":
 		return
-	if rules.stage == "roll":
-		action_box.add_child(_button("Roll", _human_roll, GREEN))
-		action_box.add_child(_body("Roll, then choose one action."))
-		return
+	_build_action_sheet(face)
+
+
+func _visible_roll() -> int:
+	if _shown_face >= 1 and _shown_face <= 6:
+		return _shown_face
+	if rules.stage == "act" and rules.roll >= 1 and rules.roll <= 6:
+		return rules.roll
+	return 0
+
+
+func _roll_caption() -> String:
+	var who: int = rules.current_player
+	if _reveal_owner >= 0:
+		who = _reveal_owner
+	return "You rolled" if who == 0 else "AI rolled"
+
+
+func _build_roll_splash(face: int) -> void:
+	var dim := ColorRect.new()
+	dim.set_anchors_preset(Control.PRESET_FULL_RECT)
+	dim.color = Color(0, 0, 0, 0.28)
+	dim.mouse_filter = Control.MOUSE_FILTER_STOP
+	roll_sheet.add_child(dim)
+	var card := PanelContainer.new()
+	card.set_anchors_preset(Control.PRESET_CENTER)
+	card.offset_left = -170.0
+	card.offset_right = 170.0
+	card.offset_top = -160.0
+	card.offset_bottom = 160.0
+	card.mouse_filter = Control.MOUSE_FILTER_STOP
+	var style := _box(CREAM, 22)
+	style.content_margin_left = 20
+	style.content_margin_right = 20
+	style.content_margin_top = 16
+	style.content_margin_bottom = 16
+	card.add_theme_stylebox_override("panel", style)
+	roll_sheet.add_child(card)
+	var box := VBoxContainer.new()
+	box.add_theme_constant_override("separation", 4)
+	box.alignment = BoxContainer.ALIGNMENT_CENTER
+	card.add_child(box)
+	box.add_child(_die_face(face, 148.0))
+	var caption := _label(_roll_caption(), 22)
+	caption.autowrap_mode = TextServer.AUTOWRAP_OFF
+	caption.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	box.add_child(caption)
+	var number := _label(str(face), 72)
+	number.autowrap_mode = TextServer.AUTOWRAP_OFF
+	number.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	box.add_child(number)
+
+
+func _build_roll_prompt(text: String) -> void:
+	var center := CenterContainer.new()
+	center.set_anchors_preset(Control.PRESET_FULL_RECT)
+	center.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	roll_sheet.add_child(center)
+	var card := PanelContainer.new()
+	card.custom_minimum_size = Vector2(420, 0)
+	card.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	var style := _box(Color(CREAM, 0.96), 18)
+	style.content_margin_left = 22
+	style.content_margin_right = 22
+	style.content_margin_top = 16
+	style.content_margin_bottom = 16
+	card.add_theme_stylebox_override("panel", style)
+	center.add_child(card)
+	var label := _label(text, 26)
+	label.autowrap_mode = TextServer.AUTOWRAP_OFF
+	label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	label.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	card.add_child(label)
+
+
+func _build_action_sheet(face: int) -> void:
 	if not _pending.is_empty():
-		action_box.add_child(_body(_target_hint()))
-		action_box.add_child(_button("Confirm", _confirm_action, GREEN))
-		action_box.add_child(_button("Cancel", _cancel_pending, CREAM, INK))
+		_build_board_pick(face)
 		return
+	_build_action_popup(face)
+
+
+func _build_action_popup(face: int) -> void:
+	var dim := ColorRect.new()
+	dim.set_anchors_preset(Control.PRESET_FULL_RECT)
+	dim.color = Color(0, 0, 0, 0.38)
+	dim.mouse_filter = Control.MOUSE_FILTER_STOP
+	roll_sheet.add_child(dim)
+	var center := CenterContainer.new()
+	center.set_anchors_preset(Control.PRESET_FULL_RECT)
+	center.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	roll_sheet.add_child(center)
+	var card := PanelContainer.new()
+	card.custom_minimum_size = Vector2(460, 0)
+	card.mouse_filter = Control.MOUSE_FILTER_STOP
+	var style := _box(CREAM, 22)
+	style.content_margin_left = 22
+	style.content_margin_right = 22
+	style.content_margin_top = 18
+	style.content_margin_bottom = 18
+	card.add_theme_stylebox_override("panel", style)
+	center.add_child(card)
+	var column := VBoxContainer.new()
+	column.add_theme_constant_override("separation", 12)
+	column.alignment = BoxContainer.ALIGNMENT_CENTER
+	card.add_child(column)
+	if face > 0:
+		var rolled := HBoxContainer.new()
+		rolled.alignment = BoxContainer.ALIGNMENT_CENTER
+		rolled.add_theme_constant_override("separation", 14)
+		column.add_child(rolled)
+		rolled.add_child(_die_face(face, 92.0))
+		var words := VBoxContainer.new()
+		words.alignment = BoxContainer.ALIGNMENT_CENTER
+		words.add_theme_constant_override("separation", 0)
+		rolled.add_child(words)
+		var caption := _label(_roll_caption(), 20)
+		caption.autowrap_mode = TextServer.AUTOWRAP_OFF
+		words.add_child(caption)
+		var number := _label(str(face), 56)
+		number.autowrap_mode = TextServer.AUTOWRAP_OFF
+		words.add_child(number)
+	var heading := _label("Choose an action", 22)
+	heading.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	column.add_child(heading)
+	if _error != "":
+		var problem := _label(_error, 16)
+		problem.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+		problem.add_theme_color_override("font_color", ROSE)
+		column.add_child(problem)
 	var any := false
 	for spec in rules.legal_types():
 		any = true
 		var spec_copy: Dictionary = spec
 		if str(spec["type"]) == "pass":
-			action_box.add_child(_button("No valid move — end turn", _play_pass, CLAY))
+			column.add_child(_touch_button("No valid move — end turn", _play_pass, CLAY))
 		else:
-			action_box.add_child(_button(rules.describe(spec_copy), _choose_action.bind(spec_copy), GREEN))
+			column.add_child(_touch_button(rules.describe(spec_copy), _choose_action.bind(spec_copy), GREEN))
 	if not any:
-		action_box.add_child(_body("Waiting for the roll."))
+		column.add_child(_label("Waiting for the roll.", 18))
+
+
+func _build_board_pick(face: int) -> void:
+	var card := PanelContainer.new()
+	card.anchor_left = 0.5
+	card.anchor_right = 0.5
+	card.anchor_top = 0.0
+	card.offset_left = -250.0
+	card.offset_right = 250.0
+	card.offset_top = 62.0
+	card.mouse_filter = Control.MOUSE_FILTER_STOP
+	var style := _box(CREAM, 22)
+	style.content_margin_left = 18
+	style.content_margin_right = 18
+	style.content_margin_top = 14
+	style.content_margin_bottom = 14
+	card.add_theme_stylebox_override("panel", style)
+	roll_sheet.add_child(card)
+	var column := VBoxContainer.new()
+	column.add_theme_constant_override("separation", 8)
+	card.add_child(column)
+	if face > 0:
+		var rolled := HBoxContainer.new()
+		rolled.alignment = BoxContainer.ALIGNMENT_CENTER
+		rolled.add_theme_constant_override("separation", 12)
+		column.add_child(rolled)
+		rolled.add_child(_die_face(face, 56.0))
+		var caption := _label(rules.describe(_pending), 22)
+		caption.autowrap_mode = TextServer.AUTOWRAP_OFF
+		caption.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+		caption.custom_minimum_size = Vector2(280, 0)
+		rolled.add_child(caption)
+	var hint := _label(_target_hint(), 16)
+	hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	hint.custom_minimum_size = Vector2(440, 0)
+	column.add_child(hint)
+	if _picked.size() == 1:
+		var chosen: Dictionary = rules.piece(str(_picked[0]))
+		if not chosen.is_empty():
+			var picked := _label("Selected: %s" % _target_line(chosen), 16)
+			picked.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+			picked.custom_minimum_size = Vector2(440, 0)
+			column.add_child(picked)
+	elif _picked.size() > 1:
+		var picked := _label("Selected %d." % _picked.size(), 16)
+		picked.custom_minimum_size = Vector2(440, 0)
+		column.add_child(picked)
+	if _error != "":
+		var problem := _label(_error, 16)
+		problem.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+		problem.custom_minimum_size = Vector2(440, 0)
+		problem.add_theme_color_override("font_color", ROSE)
+		column.add_child(problem)
+	var row := HBoxContainer.new()
+	row.add_theme_constant_override("separation", 10)
+	column.add_child(row)
+	action_box = row
+	row.add_child(_touch_button("Confirm", _confirm_action, GREEN))
+	row.add_child(_touch_button("Cancel", _cancel_pending, CREAM, INK))
+
+
+func _is_picked(id: String) -> bool:
+	if _picked.has(id):
+		return true
+	return _same_damage_group(id, _picked)
+
+
+func _is_board_target(id: String) -> bool:
+	if _pending.is_empty():
+		return false
+	if rules.targets_for(_pending).has(id):
+		return true
+	if str(_pending.get("type", "")) != "damage":
+		return false
+	return _same_damage_group(id, rules.damage_targets())
+
+
+func _damage_target_id(id: String) -> String:
+	if rules.damage_targets().has(id):
+		return id
+	var piece: Dictionary = rules.piece(id)
+	var group := int(piece.get("group", -1))
+	if group < 0:
+		return id
+	for raw in rules.damage_targets():
+		var other: Dictionary = rules.piece(str(raw))
+		if int(other.get("group", -1)) == group:
+			return str(raw)
+	return id
+
+
+func _same_damage_group(id: String, ids: Array) -> bool:
+	var piece: Dictionary = rules.piece(id)
+	var group := int(piece.get("group", -1))
+	if group < 0:
+		return false
+	for raw in ids:
+		var other: Dictionary = rules.piece(str(raw))
+		if int(other.get("group", -1)) == group:
+			return true
+	return false
+
+
+func _target_line(p: Dictionary) -> String:
+	var place := "on the floor"
+	if str(p["zone"]) == "sofa":
+		place = "on the sofa"
+	elif str(p["zone"]) == "rug":
+		place = "on the rug"
+	var extra := _short_status(p)
+	if extra == "":
+		return "%s, %s" % [_kind_label(p), place]
+	return "%s, %s · %s" % [_kind_label(p), place, extra]
+
+
+func _die_face(face: int, size: float) -> TextureRect:
+	var face_rect := TextureRect.new()
+	face_rect.custom_minimum_size = Vector2(size, size)
+	face_rect.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	face_rect.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+	face_rect.texture = _art("res://assets/ui/d%d.png" % face)
+	return face_rect
+
+
+func _touch_button(text: String, callback: Callable, bg: Color, fg: Color = CREAM) -> Button:
+	var button := _button(text, callback, bg, fg)
+	button.custom_minimum_size = Vector2(0, 62)
+	button.add_theme_font_size_override("font_size", 20)
+	button.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	return button
 
 
 func _target_hint() -> String:
@@ -510,12 +789,114 @@ func _target_hint() -> String:
 	return "Tap a Box Fort that is not inside a fortified group."
 
 
+func _throw_from_board() -> void:
+	if rules.phase == "initiative":
+		_throw_initiative()
+	else:
+		_human_roll()
+
+
 func _human_roll() -> void:
-	if rules.current_player != 0 or rules.stage != "roll":
+	if _rolling or _result_hold or rules.current_player != 0 or rules.stage != "roll":
 		return
-	rules.roll_die()
+	var token := _roll_token
+	_rolling = true
 	_error = ""
 	_fill_battle()
+	var face := rules.roll_die()
+	await _throw_die(face)
+	if token != _roll_token:
+		return
+	_rolling = false
+	_shown_face = face
+	_result_hold = true
+	_fill_battle()
+	await get_tree().create_timer(0.9).timeout
+	if token != _roll_token:
+		return
+	_result_hold = false
+	_shown_face = 0
+	_fill_actions()
+
+
+func _throw_initiative() -> void:
+	if _rolling or rules.phase != "initiative":
+		return
+	var token := _roll_token
+	_rolling = true
+	_error = ""
+	var result = rules.roll_initiative()
+	var history: Array = result.get("rolls", [])
+	for pair in history:
+		if token != _roll_token:
+			return
+		_reveal_owner = 0
+		_shown_face = 0
+		_result_hold = false
+		_fill_battle()
+		await _throw_die(int(pair[0]))
+		if token != _roll_token:
+			return
+		_shown_face = int(pair[0])
+		_result_hold = true
+		_rolling = false
+		_fill_battle()
+		await get_tree().create_timer(0.9).timeout
+		if token != _roll_token:
+			return
+		_rolling = true
+		_result_hold = false
+		_reveal_owner = 1
+		_shown_face = 0
+		_fill_battle()
+		await _throw_die(int(pair[1]))
+		if token != _roll_token:
+			return
+		_shown_face = int(pair[1])
+		_result_hold = true
+		_rolling = false
+		_fill_battle()
+		await get_tree().create_timer(0.9).timeout
+		if token != _roll_token:
+			return
+		_rolling = true
+		_result_hold = false
+	_reveal_owner = -1
+	_shown_face = 0
+	_rolling = false
+	if token != _roll_token:
+		return
+	_fill_battle()
+	_maybe_ai()
+
+
+func _throw_die(face: int) -> void:
+	await get_tree().process_frame
+	var room := _battle_room()
+	if room == null:
+		await get_tree().create_timer(0.2).timeout
+		return
+	var die = DieThrow.new()
+	die.set_anchors_preset(Control.PRESET_FULL_RECT)
+	die.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	room.add_child(die)
+	await die.play(face)
+	if is_instance_valid(die):
+		die.queue_free()
+
+
+func _battle_room() -> Control:
+	return _find_battle_room(self)
+
+
+func _find_battle_room(node: Node) -> Control:
+	if node is Control and (node as Control).has_meta("battle_room"):
+		return node
+	for child in node.get_children():
+		var found := _find_battle_room(child)
+		if found != null:
+			return found
+	return null
 
 
 func _choose_action(spec: Dictionary) -> void:
@@ -586,19 +967,33 @@ func _maybe_ai() -> void:
 func _ai_turn() -> void:
 	var token := _ai_token
 	_ai_busy = true
-	_fill_actions()
+	_fill_battle()
 	while rules.phase == "battle" and rules.current_player == 1 and token == _ai_token:
-		await get_tree().create_timer(0.45).timeout
+		await get_tree().create_timer(0.35).timeout
 		if token != _ai_token or rules.phase != "battle":
 			_ai_busy = false
 			return
 		if rules.stage == "roll":
-			rules.roll_die()
+			_rolling = true
+			_shown_face = 0
+			_result_hold = false
 			_fill_battle()
-			await get_tree().create_timer(0.55).timeout
+			var face := rules.roll_die()
+			await _throw_die(face)
 			if token != _ai_token:
 				_ai_busy = false
 				return
+			_rolling = false
+			_shown_face = face
+			_result_hold = true
+			_fill_battle()
+			await get_tree().create_timer(0.9).timeout
+			if token != _ai_token:
+				_ai_busy = false
+				return
+			_result_hold = false
+			_shown_face = 0
+			_fill_battle()
 		var move := AI.choose(rules)
 		var err = rules.apply(move)
 		if err != "":
@@ -616,6 +1011,8 @@ func _ai_turn() -> void:
 
 func _cancel_ai() -> void:
 	_ai_token += 1
+	_roll_token += 1
+	_rolling = false
 	_ai_busy = false
 
 
@@ -652,7 +1049,7 @@ func _jail_strip(jailer: int) -> HFlowContainer:
 		icon.custom_minimum_size = Vector2(42, 42)
 		icon.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
 		icon.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
-		icon.texture = _art(rules.texture_path(p))
+		icon.texture = _piece_art(rules.texture_path(p))
 		flow.add_child(icon)
 	return flow
 
@@ -661,24 +1058,19 @@ func _army_block(owner: int, _deploying: bool) -> PanelContainer:
 	var panel := PanelContainer.new()
 	panel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	panel.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	var style := _box(CREAM, 14)
-	var active = rules.phase == "battle" and rules.current_player == owner
-	style.border_color = GREEN if active else Color(INK, 0.12)
-	for edge in ["border_width_left", "border_width_top", "border_width_right", "border_width_bottom"]:
-		style.set(edge, 4 if active else 1)
-	panel.add_theme_stylebox_override("panel", style)
-	var box := VBoxContainer.new()
-	box.add_theme_constant_override("separation", 6)
-	panel.add_child(box)
-	var who := "You" if owner == 0 else "AI"
-	var army := str(Rules.COLOR_NAMES[str(rules.piece("%d_boss_0" % owner)["color"])])
-	var banner := "%s · %s · Jail %d VP" % [who, army, rules.vp(owner)]
-	if rules.phase == "battle" and rules.boss_exposed_for_attacker(1 - owner):
-		banner += " · Boss exposed"
-	box.add_child(_label(banner, 18))
 	if _deploying:
-		box.add_child(_label("Your pieces", 14))
-		box.add_child(_piece_flow(owner, "floor"))
+		var style := _box(CREAM, 14)
+		style.border_color = Color(INK, 0.12)
+		for edge in ["border_width_left", "border_width_top", "border_width_right", "border_width_bottom"]:
+			style.set(edge, 1)
+		panel.add_theme_stylebox_override("panel", style)
+	else:
+		panel.add_theme_stylebox_override("panel", StyleBoxEmpty.new())
+	var box := VBoxContainer.new()
+	box.add_theme_constant_override("separation", 8 if _deploying else 0)
+	panel.add_child(box)
+	if _deploying:
+		box.add_child(_label("You · %s · Jail %d VP" % [str(Rules.COLOR_NAMES[str(rules.piece("%d_boss_0" % owner)["color"])]), rules.vp(owner)], 16))
 	var room := _living_room(owner, 700.0 if _deploying else 0.0)
 	if _deploying:
 		var center := CenterContainer.new()
@@ -686,8 +1078,21 @@ func _army_block(owner: int, _deploying: bool) -> PanelContainer:
 		center.add_child(room)
 		box.add_child(center)
 	else:
-		box.add_child(room)
-		box.add_child(_piece_flow(owner, "floor"))
+		var clip := Control.new()
+		clip.clip_contents = true
+		clip.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		clip.size_flags_vertical = Control.SIZE_EXPAND_FILL
+		clip.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		box.add_child(clip)
+		var mat := ColorRect.new()
+		mat.set_anchors_preset(Control.PRESET_FULL_RECT)
+		mat.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		mat.color = Color("efe9e3")
+		clip.add_child(mat)
+		clip.add_child(room)
+		clip.resized.connect(_fit_board_cover.bind(clip, room))
+		_mount_battle_hud(clip, owner)
+		_fit_board_cover(clip, room)
 	return panel
 
 
@@ -700,7 +1105,7 @@ func _living_room(owner: int, lock_width: float) -> Control:
 		board.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
 	else:
 		board.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		board.custom_minimum_size = Vector2(0, 210)
+		board.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	var art := TextureRect.new()
 	art.set_anchors_preset(Control.PRESET_FULL_RECT)
 	art.texture = _art("res://assets/ui/board.png")
@@ -708,6 +1113,8 @@ func _living_room(owner: int, lock_width: float) -> Control:
 	art.stretch_mode = TextureRect.STRETCH_SCALE
 	art.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	board.add_child(art)
+	board.mouse_filter = Control.MOUSE_FILTER_STOP
+	board.gui_input.connect(_on_board_press.bind(owner, board))
 	var skip := {}
 	for zone in ["sofa", "rug"]:
 		var count := 3 if zone == "sofa" else 6
@@ -729,9 +1136,118 @@ func _living_room(owner: int, lock_width: float) -> Control:
 			board.add_child(_overlay_slot(owner, zone, slot, occupant, rect))
 	var boss = rules.piece("%d_boss_0" % owner)
 	if not boss.is_empty() and not bool(boss["captured"]) and str(boss["zone"]) == "floor":
-		board.add_child(_overlay_slot(owner, "floor", -1, boss, BOSS_SLOT))
-	board.resized.connect(_fit_board_aspect.bind(board))
+		board.add_child(_overlay_slot(owner, "floor", -1, boss, _ensure_spot(boss, 0)))
+	var standing := _floor_pieces(owner)
+	for i in standing.size():
+		board.add_child(_overlay_slot(owner, "floor", i, standing[i], _ensure_spot(standing[i], i)))
+	if lock_width <= 0.0:
+		board.set_anchors_preset(Control.PRESET_TOP_LEFT)
+		board.set_meta("battle_room", true)
+	if lock_width > 0.0:
+		board.resized.connect(_fit_board_aspect.bind(board))
 	return board
+
+
+func _fit_board_cover(clip: Control, board: Control) -> void:
+	var avail := clip.size
+	if avail.x < 2.0 or avail.y < 2.0:
+		return
+	var fit_w := avail.y * BOARD_RATIO
+	var fit_h := avail.y
+	if fit_w > avail.x:
+		fit_w = avail.x
+		fit_h = fit_w / BOARD_RATIO
+	var cover_w := avail.x
+	var cover_h := cover_w / BOARD_RATIO
+	if cover_h < avail.y:
+		cover_h = avail.y
+		cover_w = cover_h * BOARD_RATIO
+	var zoom := 0.0
+	var width := lerpf(fit_w, cover_w, zoom)
+	var height := lerpf(fit_h, cover_h, zoom)
+	var pos := Vector2((avail.x - width) * 0.5, (avail.y - height) * 0.5)
+	if height > avail.y:
+		pos.y = -(height - avail.y) * 0.7
+	var fitted := Vector2(width, height)
+	if board.size != fitted or board.position != pos:
+		board.size = fitted
+		board.position = pos
+	if not clip.has_meta("battle_hud"):
+		return
+	var hud: Control = clip.get_meta("battle_hud")
+	var visible_pos := Vector2(maxf(pos.x, 0.0), maxf(pos.y, 0.0))
+	var visible_end := Vector2(minf(pos.x + width, avail.x), minf(pos.y + height, avail.y))
+	var hud_size := visible_end - visible_pos
+	if hud.position == visible_pos and hud.size == hud_size:
+		return
+	hud.position = visible_pos
+	hud.size = hud_size
+
+
+func _mount_battle_hud(clip: Control, owner: int) -> void:
+	var hud := Control.new()
+	hud.set_anchors_preset(Control.PRESET_TOP_LEFT)
+	hud.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	clip.add_child(hud)
+	clip.set_meta("battle_hud", hud)
+	var top := PanelContainer.new()
+	top.anchor_right = 1.0
+	top.offset_bottom = 50.0
+	top.mouse_filter = Control.MOUSE_FILTER_STOP
+	top.add_theme_stylebox_override("panel", _box(_room_color(owner), 0))
+	hud.add_child(top)
+	var top_row := HBoxContainer.new()
+	top_row.add_theme_constant_override("separation", 8)
+	top.add_child(top_row)
+	header_label = _label("", 18)
+	header_label.autowrap_mode = TextServer.AUTOWRAP_OFF
+	header_label.clip_text = true
+	header_label.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
+	header_label.add_theme_color_override("font_color", CREAM)
+	header_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	header_label.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	header_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	top_row.add_child(header_label)
+	top_row.add_child(_battle_button("Help", _open_help, CREAM, INK))
+	top_row.add_child(_battle_button("Leave", _confirm_leave, CREAM, INK))
+	roll_sheet = Control.new()
+	roll_sheet.set_anchors_preset(Control.PRESET_FULL_RECT)
+	roll_sheet.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	hud.add_child(roll_sheet)
+
+
+func _room_color(owner: int) -> Color:
+	var targeting: bool = rules.phase == "battle" and rules.current_player == 0 and not _pending.is_empty() and owner == 1
+	if targeting:
+		return ROSE
+	return GREEN if owner == 0 else Color("8a4a28")
+
+
+func _room_title(owner: int) -> String:
+	var targeting: bool = rules.phase == "battle" and rules.current_player == 0 and not _pending.is_empty() and owner == 1
+	var title := "YOUR LIVING ROOM" if owner == 0 else "AI LIVING ROOM"
+	if targeting:
+		title = "ENEMY LIVING ROOM"
+	var army := str(Rules.COLOR_NAMES[str(rules.piece("%d_boss_0" % owner)["color"])])
+	var exposed := ""
+	if rules.phase == "battle" and rules.boss_exposed_for_attacker(1 - owner):
+		exposed = "  ·  Boss exposed"
+	return "%s  ·  %s  ·  You %d VP  ·  AI %d VP%s" % [title, army, rules.vp(0), rules.vp(1), exposed]
+
+
+func _battle_button(text: String, callback: Callable, bg: Color, fg: Color = CREAM) -> Button:
+	var button := _button(text, callback, bg, fg)
+	button.custom_minimum_size = Vector2(0, 34)
+	button.add_theme_font_size_override("font_size", 15)
+	return button
+
+
+func _human_can_throw() -> bool:
+	if _rolling or _ai_busy or _result_hold:
+		return false
+	if rules.phase == "initiative":
+		return true
+	return rules.phase == "battle" and rules.current_player == 0 and rules.stage == "roll" and _pending.is_empty()
 
 
 func _fit_board_aspect(board: Control) -> void:
@@ -773,7 +1289,17 @@ func _anchor_control(node: Control, rect: Rect2) -> void:
 	node.offset_bottom = -1
 
 
+func _at_least_piece_size(rect: Rect2) -> Rect2:
+	if rect.size.x >= PIECE_SIZE.x and rect.size.y >= PIECE_SIZE.y:
+		return rect
+	var grown := Vector2(maxf(rect.size.x, PIECE_SIZE.x), maxf(rect.size.y, PIECE_SIZE.y))
+	var center := rect.get_center()
+	return Rect2(center - grown * 0.5, grown)
+
+
 func _overlay_slot(owner: int, zone: String, slot: int, occupant: Dictionary, rect: Rect2) -> Button:
+	if not occupant.is_empty() and str(occupant["kind"]) != "boss":
+		rect = _at_least_piece_size(rect)
 	var button := Button.new()
 	_anchor_control(button, rect)
 	button.focus_mode = Control.FOCUS_NONE
@@ -789,7 +1315,7 @@ func _overlay_slot(owner: int, zone: String, slot: int, occupant: Dictionary, re
 		sprite.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
 		sprite.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
 		sprite.mouse_filter = Control.MOUSE_FILTER_IGNORE
-		sprite.texture = _art(rules.texture_path(occupant))
+		sprite.texture = _piece_art(rules.texture_path(occupant))
 		button.add_child(sprite)
 		var caption := Label.new()
 		caption.text = _short_status(occupant)
@@ -813,23 +1339,36 @@ func _overlay_slot(owner: int, zone: String, slot: int, occupant: Dictionary, re
 
 
 func _paint_overlay(button: Button, occupant: Dictionary, id: String) -> void:
-	var bg := Color(1, 1, 1, 0.14)
-	var border := Color(1, 1, 1, 0.72)
+	var bg := Color(0, 0, 0, 0)
+	var border := Color(0, 0, 0, 0)
+	var marked := false
 	if not occupant.is_empty() and bool(occupant.get("shield", false)):
-		bg = Color(0.72, 0.84, 0.96, 0.35)
+		bg = Color(0.72, 0.84, 0.96, 0.32)
 		border = Color("2f6a9a")
+		marked = true
 	if not occupant.is_empty() and int(occupant.get("group", -1)) >= 0:
-		bg = Color(0.95, 0.72, 0.48, 0.38)
+		bg = Color(0.95, 0.72, 0.48, 0.34)
 		border = Color("8a4b22")
+		marked = true
 	if id != "" and id == _selected:
 		border = Color("c9a227")
-		bg.a = maxf(bg.a, 0.45)
-	if id != "" and _picked.has(id):
+		bg = Color(border, 0.35)
+		marked = true
+	if id != "" and _is_picked(id):
 		border = CLAY
 		bg = Color(CLAY, 0.45)
-	elif id != "" and not _pending.is_empty() and rules.targets_for(_pending).has(id):
+		marked = true
+	elif id != "" and _is_board_target(id):
 		border = GREEN
 		bg = Color(GREEN, 0.28)
+		marked = true
+	if not marked:
+		var empty := StyleBoxEmpty.new()
+		button.add_theme_stylebox_override("normal", empty)
+		button.add_theme_stylebox_override("hover", empty)
+		button.add_theme_stylebox_override("pressed", empty)
+		button.add_theme_stylebox_override("focus", empty)
+		return
 	var style := _box(bg, 8)
 	style.border_color = border
 	for edge in ["border_width_left", "border_width_top", "border_width_right", "border_width_bottom"]:
@@ -855,58 +1394,96 @@ func _short_status(p: Dictionary) -> String:
 	return " ".join(bits)
 
 
-func _piece_flow(owner: int, zone: String) -> ScrollContainer:
-	var scroller := ScrollContainer.new()
-	scroller.custom_minimum_size = Vector2(0, 78)
-	scroller.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_AUTO
-	scroller.vertical_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
-	var flow := HBoxContainer.new()
-	flow.add_theme_constant_override("separation", 6)
-	scroller.add_child(flow)
-	var found := false
+func _ensure_spot(p: Dictionary, fallback: int) -> Rect2:
+	var id := str(p["id"])
+	if _spot.has(id):
+		return _spot[id]
+	var rect := BOSS_SLOT
+	if str(p["kind"]) != "boss":
+		var index := mini(fallback, FLOOR_SLOTS.size() - 1)
+		rect = FLOOR_SLOTS[index]
+	_spot[id] = rect
+	return rect
+
+
+func _on_board_press(event: InputEvent, owner: int, board: Control) -> void:
+	if _press_down(event) and _human_can_throw() and owner == _battle_focus():
+		board.accept_event()
+		_throw_from_board()
+		return
+	if _screen != "deploy" or owner != 0 or not _press_down(event):
+		return
+	board.accept_event()
+	if _selected == "":
+		_error = "Select a piece, then tap the living room where it should stand."
+		_refresh_deploy_status()
+		return
+	var size := board.size
+	if size.x < 1.0 or size.y < 1.0:
+		return
+	var local := _local_point(board, event)
+	_drop_floor(_selected, Vector2(local.x / size.x, local.y / size.y))
+
+
+func _press_down(event: InputEvent) -> bool:
+	if event is InputEventMouseButton:
+		return event.pressed and event.button_index == MOUSE_BUTTON_LEFT
+	if event is InputEventScreenTouch:
+		return event.pressed
+	return false
+
+
+func _local_point(board: Control, event: InputEvent) -> Vector2:
+	var point := board.get_local_mouse_position()
+	if event is InputEventMouse:
+		point = event.global_position
+	elif event is InputEventScreenTouch:
+		point = event.position
+	else:
+		return point
+	return board.get_global_transform_with_canvas().affine_inverse() * point
+
+
+func _drop_floor(id: String, norm: Vector2) -> void:
+	var err = rules.place(id, "floor", -1)
+	if err != "":
+		_error = err
+		_fill_deploy_board()
+		_refresh_deploy_status()
+		return
+	var origin := norm - TOKEN * 0.5
+	origin.x = clampf(origin.x, 0.0, 1.0 - TOKEN.x)
+	origin.y = clampf(origin.y, 0.0, 1.0 - TOKEN.y)
+	_spot[id] = Rect2(origin, TOKEN)
+	_selected = ""
+	_error = ""
+	_fill_deploy_board()
+	_refresh_deploy_status()
+
+
+func _floor_pieces(owner: int) -> Array:
+	var standing: Array = []
 	for p in rules.pieces:
-		if int(p["owner"]) != owner or str(p["zone"]) != zone or bool(p["captured"]):
+		if int(p["owner"]) != owner or str(p["zone"]) != "floor" or bool(p["captured"]):
 			continue
 		if str(p["kind"]) == "boss":
 			continue
-		found = true
-		var button := Button.new()
-		button.custom_minimum_size = Vector2(68, 68)
-		button.icon = _art(rules.texture_path(p))
-		button.expand_icon = true
-		button.tooltip_text = "%s %s" % [_kind_label(p), _short_status(p)]
-		_paint_piece_button(button, p, str(p["id"]))
-		button.pressed.connect(_on_piece.bind(str(p["id"])))
-		flow.add_child(button)
-	if not found:
-		flow.add_child(_label("None", 14))
-	return scroller
-
-
-func _paint_piece_button(button: Button, occupant: Dictionary, id: String) -> void:
-	var bg := CREAM
-	var fg := INK
-	if not occupant.is_empty() and bool(occupant.get("shield", false)):
-		bg = Color("d7e4f5")
-	if not occupant.is_empty() and int(occupant.get("group", -1)) >= 0:
-		bg = Color("f3d7c4")
-	if id != "" and id == _selected:
-		bg = Color("f2d56b")
-	if id != "" and _picked.has(id):
-		bg = Color("f0b429")
-	elif id != "" and not _pending.is_empty() and rules.targets_for(_pending).has(id):
-		bg = Color("cfe8d4")
-	button.add_theme_stylebox_override("normal", _box(bg, 10))
-	button.add_theme_stylebox_override("hover", _box(bg.lightened(0.05), 10))
-	button.add_theme_stylebox_override("pressed", _box(bg.darkened(0.05), 10))
-	button.add_theme_color_override("font_color", fg)
-	button.add_theme_color_override("font_hover_color", fg)
+		standing.append(p)
+	return standing
 
 
 func _on_slot(owner: int, zone: String, slot: int) -> void:
+	if _human_can_throw():
+		_throw_from_board()
+		return
 	var occupant = rules.piece_at(owner, zone, slot)
 	if zone == "floor":
-		_on_piece("%d_boss_0" % owner)
+		if slot < 0:
+			_on_piece("%d_boss_0" % owner)
+		else:
+			var standing := _floor_pieces(owner)
+			if slot < standing.size():
+				_on_piece(str(standing[slot]["id"]))
 		return
 	if _screen == "deploy":
 		if owner != 0:
@@ -932,6 +1509,9 @@ func _on_slot(owner: int, zone: String, slot: int) -> void:
 
 
 func _on_piece(id: String) -> void:
+	if _human_can_throw():
+		_throw_from_board()
+		return
 	if _screen == "deploy":
 		_selected = id
 		_error = ""
@@ -944,6 +1524,8 @@ func _on_piece(id: String) -> void:
 func _toggle_target(id: String) -> void:
 	if _pending.is_empty() or rules.current_player != 0 or _ai_busy:
 		return
+	if str(_pending.get("type", "")) == "damage":
+		id = _damage_target_id(id)
 	if not rules.targets_for(_pending).has(id):
 		_error = "That piece is not a legal target."
 		_fill_actions()
@@ -998,6 +1580,7 @@ func _confirm_leave() -> void:
 func _leave_match() -> void:
 	_cancel_ai()
 	rules = Rules.new()
+	_spot = {}
 	_go("menu")
 
 
@@ -1006,7 +1589,7 @@ func _open_help() -> void:
 
 
 func _help_text() -> String:
-	return "Each army has 12 Alley Cats (1 VP), 5 Box Forts (3 VP), 2 Yarn Cannons (10 VP, 10 HP) and 1 Boss (5 VP, 10 HP).\n\nOne heart is 2 HP. A roll of 2, 4, or 6 removes 1, 2, or 3 hearts. Extra damage does not spill.\n\nSofa: each piece gets one shield. A shield cancels the whole attack. When capturing several Alley Cats, each shield you break spends one capture.\n\nRug: pair one Alley Cat or one Yarn Cannon with one Box Fort. That group has 2 hearts (4 HP). Destroy them to take every piece in the group. A fortified cannon loses the rug hearts first, then its own.\n\nOnly one Yarn Cannon may use the sofa or the rug. The Boss cannot. Capture 8 Alley Cats and 3 Box Forts to expose the enemy Boss, then remove its 5 hearts. The battle ends, and the higher Cat Jail VP wins. A tie is a draw."
+	return "Each army has 12 Alley Cats (1 VP), 5 Box Forts (3 VP), 2 Yarn Cannons (10 VP, 10 HP) and 1 Boss (5 VP, 10 HP).\n\nDuring setup, tap a piece and then tap anywhere on your living room to stand it there. The sofa and the rug are the only special spots.\n\nOne heart is 2 HP. A roll of 2, 4, or 6 removes 1, 2, or 3 hearts. Extra damage does not spill.\n\nSofa: each piece gets one shield. A shield cancels the whole attack. When capturing several Alley Cats, each shield you break spends one capture.\n\nRug: pair one Alley Cat or one Yarn Cannon with one Box Fort. That group has 2 hearts (4 HP). Destroy them to take every piece in the group. A fortified cannon loses the rug hearts first, then its own.\n\nOnly one Yarn Cannon may use the sofa or the rug. The Boss cannot. Capture 8 Alley Cats and 3 Box Forts to expose the enemy Boss, then remove its 5 hearts. The battle ends, and the higher Cat Jail VP wins. A tie is a draw."
 
 
 func _open_modal(heading: String, body: String, on_yes: Callable) -> void:
@@ -1138,3 +1721,26 @@ func _art(path: String) -> Texture2D:
 	var loaded := load(path) as Texture2D
 	_tex[path] = loaded
 	return loaded
+
+
+func _piece_art(path: String) -> Texture2D:
+	var key := path + "#piece"
+	if _tex.has(key):
+		return _tex[key]
+	var source := _art(path)
+	if source == null:
+		return source
+	var image := source.get_image()
+	if image == null:
+		_tex[key] = source
+		return source
+	if image.is_compressed():
+		image.decompress()
+	var used := image.get_used_rect()
+	if used.size.x < 2 or used.size.y < 2:
+		_tex[key] = source
+		return source
+	var crop := image.get_region(used)
+	var fitted := ImageTexture.create_from_image(crop)
+	_tex[key] = fitted
+	return fitted
